@@ -46,8 +46,10 @@ class LayerTap:
         sl = self.slices[j]
         x = args[0]
         z = x.reshape(-1, x.shape[-1]).float() @ self.A.to(x.device, torch.float32).T  # (N, R)
-        self.G += (z.T @ z).cpu().double()
-        self.Q[sl] += (z[:, sl].T @ z).cpu().double()
+        # float32 rounding here makes G indefinite for large merged ranks, which the small ridge cannot absorb
+        zd = z.to(self.merger.fp64_device, torch.float64)
+        self.G += (zd.T @ zd).cpu()
+        self.Q[sl] += (zd[:, sl].T @ zd).cpu()
         self.count += z.shape[0]
         delta = z[:, sl] @ self.Bs[j].to(x.device, torch.float32).T
         return y + delta.reshape(y.shape).to(y.dtype)
@@ -60,11 +62,11 @@ class LayerTap:
         eye = torch.eye(self.G.shape[0], dtype=torch.float64)
         G, Q = self.G / self.count, self.Q / self.count
         R = torch.linalg.solve(G + lambda_reg * eye, Q.T).T  # Q G^-1, G symmetric
-        Bd = B.to(device, torch.float32)
-        B_merged = (Bd @ R.to(device, torch.float32)).to("cpu", B.dtype)
+        Bd = B.to(device, torch.float64)
+        B_merged = (Bd @ R.to(device)).to("cpu", B.dtype)
 
         # sum_k ||B_comb R Z_k - B_k A_k X_k||^2 expands to terms in G, Q and the diagonal blocks of Q.
-        BtB = (Bd.T @ Bd).cpu().double()
+        BtB = (Bd.T @ Bd).cpu()
         ref = sum(torch.sum(BtB[sl, sl] * Q[sl, sl]).item() for sl in self.slices)
         errors = {}
         for name, router in (("ssr", R), ("average", eye / len(self.slices)), ("sum", eye)):
@@ -76,6 +78,8 @@ class SSRMerger:
     def __init__(self, loras):
         """loras: one {weight key: (A, B)} dict per LoRA, with alpha and strength folded into B."""
         self.active = None  # index of the LoRA applied during calibration
+        device = comfy.model_management.get_torch_device()
+        self.fp64_device = device if comfy.model_management.supports_fp64(device) else torch.device("cpu")
         self.taps = {}
         for key in sorted({k for lora in loras for k in lora}):
             ks = [k for k, lora in enumerate(loras) if key in lora]
@@ -98,11 +102,10 @@ class SSRMerger:
 
     def solve(self, lambda_reg):
         """Returns {weight key: (A_merged, B_merged)}."""
-        device = comfy.model_management.get_torch_device()
         merged, undersampled = {}, 0
         err_total, ref_total = {}, 0.0
         for key, tap in self.taps.items():
-            merged[key], stats = tap.solve(lambda_reg, device)
+            merged[key], stats = tap.solve(lambda_reg, self.fp64_device)
             if stats is None:
                 continue
             errors, ref = stats
